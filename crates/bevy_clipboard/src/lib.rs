@@ -19,6 +19,12 @@
 //! effect. The [`Clipboard`] resource still works, but reads and writes go to an in-process
 //! buffer that is invisible to other applications and does not survive process exit.
 //!
+//! On Wayland (with the `wayland` feature), `arboard` needs the privileged data-control
+//! protocols. It is used wherever they are available, for the same unrestricted clipboard
+//! access as on other platforms. Some environments do not allow the app to use them: there,
+//! the clipboard uses the core protocol once a window is open, which only works while one of
+//! the app's windows has keyboard focus.
+//!
 //! On Windows and Unix, clipboard operations are performed synchronously and results are
 //! available immediately. On wasm32, results are accessed via [`ClipboardRead`], which can
 //! be polled for completion.
@@ -41,6 +47,15 @@ use wgpu_types::{Extent3d, TextureDimension, TextureFormat};
 use wasm_bindgen_futures::JsFuture;
 use {alloc::sync::Arc, bevy_platform::sync::Mutex};
 
+#[cfg(all(
+    feature = "wayland",
+    feature = "system_clipboard",
+    unix,
+    not(target_vendor = "apple"),
+    not(target_os = "android")
+))]
+mod wayland;
+
 /// Commonly used types and traits from `bevy_clipboard`.
 pub mod prelude {
     pub use crate::{Clipboard, ClipboardPlugin, ClipboardRead};
@@ -57,6 +72,14 @@ pub struct ClipboardPlugin;
 impl bevy_app::Plugin for ClipboardPlugin {
     fn build(&self, app: &mut bevy_app::App) {
         app.init_resource::<Clipboard>();
+        #[cfg(all(
+            feature = "wayland",
+            feature = "system_clipboard",
+            unix,
+            not(target_vendor = "apple"),
+            not(target_os = "android")
+        ))]
+        wayland::build(app);
     }
 }
 
@@ -191,6 +214,15 @@ fn try_imagedata_from_image(image: &Image) -> Result<arboard::ImageData<'_>, Cli
 pub struct Clipboard {
     #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
     system_clipboard: Option<arboard::Clipboard>,
+    /// The Wayland clipboard used in place of `arboard` where the app lacks data-control.
+    #[cfg(all(
+        feature = "wayland",
+        feature = "system_clipboard",
+        unix,
+        not(target_vendor = "apple"),
+        not(target_os = "android")
+    ))]
+    wayland: wayland::Wayland,
     // Unfortunately, this cannot be simplified to `not(any(feature = "system_clipboard", target_arch = "wasm32"))`.
     // `system_clipboard` is a platform-conditional dependency (windows/unix only), so on other platforms
     // (Android, iOS, etc.) `cfg(feature = "system_clipboard")` can be true even though the crate is not
@@ -216,6 +248,14 @@ impl Default for Clipboard {
         Self {
             #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
             system_clipboard: arboard::Clipboard::new().ok(),
+            #[cfg(all(
+                feature = "wayland",
+                feature = "system_clipboard",
+                unix,
+                not(target_vendor = "apple"),
+                not(target_os = "android")
+            ))]
+            wayland: wayland::Wayland::Unchecked,
             #[cfg(not(any(
                 all(any(windows, unix), feature = "system_clipboard"),
                 target_arch = "wasm32"
@@ -230,6 +270,17 @@ impl Clipboard {
     ///
     /// On Windows and Unix `ClipboardRead`s are completed instantly, on wasm32 the result is fetched asynchronously.
     pub fn fetch_text(&mut self) -> ClipboardRead {
+        #[cfg(all(
+            feature = "wayland",
+            feature = "system_clipboard",
+            unix,
+            not(target_vendor = "apple"),
+            not(target_os = "android")
+        ))]
+        if let wayland::Wayland::Core(core) = &mut self.wayland {
+            return ClipboardRead::Ready(core.load());
+        }
+
         #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
         {
             ClipboardRead::Ready(
@@ -297,6 +348,17 @@ impl Clipboard {
     ///
     /// Returns error if `text` failed to be stored on the clipboard.
     pub fn set_text<'a, T: Into<Cow<'a, str>>>(&mut self, text: T) -> Result<(), ClipboardError> {
+        #[cfg(all(
+            feature = "wayland",
+            feature = "system_clipboard",
+            unix,
+            not(target_vendor = "apple"),
+            not(target_os = "android")
+        ))]
+        if let wayland::Wayland::Core(core) = &mut self.wayland {
+            return core.store(text.into().into_owned());
+        }
+
         #[cfg(all(any(unix, windows), feature = "system_clipboard"))]
         {
             self.system_clipboard
